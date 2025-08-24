@@ -1,0 +1,167 @@
+import sys, os
+sys.path.append(os.getcwd())  # 添加当前目录到模块路径
+
+import cv2
+import numpy as np
+import torch
+import csv
+import importlib.util
+import os
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"✅ 当前使用设备: {device}")
+
+# ✅ 加载 FlowNetS.py 模型定义
+spec = importlib.util.spec_from_file_location("FlowNetS", "./FlowNetS.py")
+FlowNetS_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(FlowNetS_module)
+FlowNetS = FlowNetS_module.FlowNetS
+
+# ✅ 初始化模型
+model = FlowNetS(batchNorm=False).to(device)
+
+# ✅ 加载权重（注意这里路径是你解压出来的原路径）
+# 自动去掉 'module.' 前缀（如果有）
+def clean_state_dict(state_dict):
+    from collections import OrderedDict
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        new_k = k.replace("module.", "") if k.startswith("module.") else k
+        new_state_dict[new_k] = v
+    return new_state_dict
+
+# 加载和清理
+checkpoint = torch.load('flownets_EPE1.951.pth', map_location=device)
+raw_state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+cleaned_state_dict = clean_state_dict(raw_state_dict)
+
+model = FlowNetS(batchNorm=False).to(device)
+model.load_state_dict(cleaned_state_dict)
+
+#checkpoint = torch.load("flownets_EPE1.951.pth",map_location=device)  
+#model.load_state_dict(checkpoint["state_dict"])  
+
+#weights_path = "flownets_EPE1.951.pth"  
+#state_dict = torch.load(weights_path, map_location=device)  
+#model.load_state_dict(state_dict)
+#model.eval()  
+
+print("✅ FlowNetS 模型加载成功")
+
+
+# ✨ 第 2 步：定义光流预测函数（FlowNetS 推理）
+def preprocess(img1, img2, size=(512, 384)):
+    img1 = cv2.resize(img1, size)
+    img2 = cv2.resize(img2, size)
+    img1 = torch.from_numpy(img1).permute(2, 0, 1).float() / 255.0
+    img2 = torch.from_numpy(img2).permute(2, 0, 1).float() / 255.0
+    inp = torch.cat([img1, img2], dim=0).unsqueeze(0).to(device)
+    return inp
+
+def compute_flow(img1, img2):
+    inp = preprocess(img1, img2)
+    with torch.no_grad():
+        flow = model(inp)[0].squeeze(0).cpu().numpy().transpose(1, 2, 0)
+    return flow  # shape: [H, W, 2]
+
+
+# 🐞 第 3 步：定义 Hexbug 跟踪函数
+def track_hexbug_with_flownets(video_path, csv_path, output_video_path, min_motion_thresh=1.0): #阈值修改处11111 2.0-1.0
+    cap = cv2.VideoCapture(video_path)
+    ret, prev_frame = cap.read()
+    if not ret:
+        print("❌ 无法打开视频")
+        return
+    
+    h, w = prev_frame.shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    out_vid = cv2.VideoWriter(output_video_path, fourcc, cap.get(cv2.CAP_PROP_FPS), (w,h))
+
+    trajectory = []
+    frame_idx = 0
+    t = 0
+
+    with open(csv_path, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["", "t", "hexbug", "x", "y"])
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            lower_green = np.array([40,40,40])
+            upper_green = np.array([80,255,255])
+            color_mask = cv2.inRange(hsv, lower_green, upper_green)
+
+            if frame_idx == 0:
+                contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                contours = [c for c in contours if cv2.contourArea(c) > 50]   #修改处222222  100-50
+                if contours:
+                    largest = max(contours, key=cv2.contourArea)
+                    M = cv2.moments(largest)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        trajectory.append((cx, cy))
+                        cv2.circle(frame, (cx, cy), 4, (0,0,255), -1)
+                        writer.writerow([frame_idx, t, 0, cx, cy])
+                    else:
+                        writer.writerow([frame_idx, t, 0, -1, -1])
+                else:
+                    writer.writerow([frame_idx, t, 0, -1, -1])
+            else:
+                flow = compute_flow(prev_frame, frame)
+                mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+                _, motion_mask = cv2.threshold(mag, min_motion_thresh, 255, cv2.THRESH_BINARY)
+                motion_mask = motion_mask.astype(np.uint8)
+                
+                if motion_mask.shape != color_mask.shape:
+                    color_mask = cv2.resize(color_mask, (motion_mask.shape[1], motion_mask.shape[0]))
+
+                
+                combined_mask = cv2.bitwise_and(motion_mask, color_mask)
+                contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                if contours:
+                    largest = max(contours, key=cv2.contourArea)
+                    M = cv2.moments(largest)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        trajectory.append((cx, cy))
+                        for i in range(1, len(trajectory)):
+                            cv2.line(frame, trajectory[i-1], trajectory[i], (0,255,0), 2)
+                        cv2.circle(frame, (cx, cy), 4, (0,0,255), -1)
+                        writer.writerow([frame_idx, t, 0, cx, cy])
+                    else:
+                        writer.writerow([frame_idx, t, 0, -1, -1])
+                else:
+                    writer.writerow([frame_idx, t, 0, -1, -1])
+
+
+            cv2.imshow("Color Mask", color_mask)
+            cv2.imshow("Motion Mask", motion_mask)
+            cv2.imshow("Combined Mask", combined_mask)
+            cv2.imshow("Frame", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break        
+
+            out_vid.write(frame)
+            prev_frame = frame.copy()
+            frame_idx += 1
+            t += 1
+
+    cap.release()
+    out_vid.release()
+    print(f"✅ 跟踪完成！轨迹输出为：{csv_path}")
+    print(f"🎞️ 视频保存为：{output_video_path}")
+
+# 🚀 第 4 步：运行跟踪代码
+
+track_hexbug_with_flownets(
+    video_path="training018.mp4",              # ✅ 替换为你的视频路径
+    csv_path="hexbug_output18.csv",
+    output_video_path="hexbug_tracked.avi"
+)
