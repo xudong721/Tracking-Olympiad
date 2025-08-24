@@ -1,0 +1,147 @@
+from ultralytics import YOLO
+import cv2
+import csv
+from tqdm import tqdm
+import numpy as np
+from deep_sort_realtime.deepsort_tracker import DeepSort
+
+def assign_ids(detections, prev_targets, max_dist=50):
+    assigned = {}
+    used_ids = set()
+
+    for det in detections:
+        min_id = -1
+        min_dist = float('inf')
+        for id_, prev_pos in prev_targets.items():
+            if id_ in used_ids:
+                continue
+            dist = np.linalg.norm(np.array(det) - np.array(prev_pos))
+            if dist < min_dist and dist < max_dist:
+                min_dist = dist
+                min_id = id_
+
+        if min_id != -1:
+            assigned[min_id] = det
+            used_ids.add(min_id)
+        else:
+            new_id = max(prev_targets.keys(), default=-1) + 1
+            while new_id in assigned or new_id in prev_targets:
+                new_id += 1
+            assigned[new_id] = det
+            used_ids.add(new_id)
+
+    return assigned
+
+def linear_interpolate(p1, p2, alpha):
+    return p1[0] * (1 - alpha) + p2[0] * alpha, p1[1] * (1 - alpha) + p2[1] * alpha
+
+def track_and_export(video_path,
+                     model_path='runs/detect/hexbug_yolov8n5/weights/best.pt',
+                     output_csv='Y_deepsort.csv',
+                     output_video='hexbug_detected_yolo.avi',
+                     conf_threshold=0.2,
+                     max_objects_per_frame=3):
+
+    model = YOLO(model_path)
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    out_vid = cv2.VideoWriter(output_video, fourcc, fps, (w, h))
+
+    trajectories = {}
+    prev_targets = {}  # ✅ 初始化
+    results = model.predict(source=video_path, stream=True, conf=conf_threshold)
+
+    frame_idx = 0
+    for result in tqdm(results, total=frame_count, desc="Tracking video"):
+        frame = result.orig_img.copy()
+        boxes = result.boxes
+
+        detections = []
+        if boxes is not None and len(boxes) > 0:
+            xyxy = boxes.xyxy.cpu().numpy()
+            confs = boxes.conf.cpu().numpy()
+
+            det_list = []
+            for i in range(len(xyxy)):
+                if confs[i] < conf_threshold:
+                    continue
+                x1, y1, x2, y2 = xyxy[i]
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                det_list.append((cx, cy, confs[i]))
+
+            det_list.sort(key=lambda x: -x[2])
+            det_list = det_list[:max_objects_per_frame]
+            detections = [(cx, cy) for cx, cy, _ in det_list]
+
+        assigned = assign_ids(detections, prev_targets)
+        prev_targets = assigned.copy()
+
+        for id_, pos in assigned.items():
+            if id_ not in trajectories:
+                trajectories[id_] = []
+            trajectories[id_].append((frame_idx, pos[0], pos[1]))
+
+            # ✅ 修复可视化变量
+            x_vis, y_vis = int(pos[0]), int(pos[1])
+            cv2.circle(frame, (x_vis, y_vis), 5, (0, 255, 0), -1)
+            cv2.putText(frame, f'ID {id_}', (x_vis, y_vis - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        out_vid.write(frame)
+        frame_idx += 1
+
+    cap.release()
+    out_vid.release()
+
+    # 插值补全轨迹
+    for id_, track in trajectories.items():
+        complete = []
+        track = sorted(track, key=lambda x: x[0])
+        for i in range(len(track) - 1):
+            f1, x1, y1 = track[i]
+            f2, x2, y2 = track[i + 1]
+            complete.append((f1, x1, y1))
+            gap = f2 - f1
+            if gap > 1:
+                for g in range(1, gap):
+                    alpha = g / gap
+                    x_interp, y_interp = linear_interpolate((x1, y1), (x2, y2), alpha)
+                    complete.append((f1 + g, x_interp, y_interp))
+        complete.append(track[-1])
+        trajectories[id_] = sorted(complete, key=lambda x: x[0])
+
+    # 构造 frame -> list of (global_id, x, y)
+    temp_frame_dict = {}
+    for id_, track in trajectories.items():
+        for frame_idx, x, y in track:
+            temp_frame_dict.setdefault(frame_idx, []).append((id_, x, y))
+
+    frame_dict = {}
+    for frame_idx, items in temp_frame_dict.items():
+        items = sorted(items, key=lambda x: x[0])
+        frame_dict[frame_idx] = items[:max_objects_per_frame]
+
+    # 写入 CSV
+    with open(output_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['', 't', 'hexbug', 'x', 'y'])
+        line_idx = 0
+
+        for frame_idx in sorted(frame_dict.keys()):
+            detections = frame_dict[frame_idx]
+            for local_id, (global_id, x, y) in enumerate(detections):
+                writer.writerow([line_idx, frame_idx, local_id, x, y])
+                line_idx += 1
+
+    print(f"✅ 视频保存为：{output_video}")
+    print(f"✅ CSV 路径保存为：{output_csv}")
+    return output_video
+
+# ▶️ 运行示例
+track_and_export('training016.mp4', max_objects_per_frame=3, conf_threshold=0.25)#改了值没用，只有hexbug数目就行
