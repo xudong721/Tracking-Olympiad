@@ -1,0 +1,157 @@
+import numpy as np
+import pandas as pd
+import cv2
+from ultralytics import YOLO
+from scipy.optimize import linear_sum_assignment
+
+# Parameter settings 参数设置
+MODEL_PATH = "runs/detect/hexbug_yolo11n_finetune_960aug/weights/best.pt"
+VIDEO_PATH = "test015.mp4"
+OUTPUT_CSV = "test015.csv"
+MAX_IDS = 1
+CONF_THRESHOLD = 0.2
+MAX_AGE = 8
+MAX_DISTANCE = 250 
+REASSIGN_DISTANCE = 0.5 
+
+def get_centroid(box, img_w, img_h):
+    x1, y1, x2, y2 = box
+    cx = np.clip((x1 + x2) / 2, 0, img_w)
+    cy = np.clip((y1 + y2) / 2, 0, img_h)
+    return (cx, cy)
+
+def euclidean(c1, c2):
+    return np.linalg.norm(np.array(c1) - np.array(c2))
+
+def interpolate(p1, p2, alpha):
+    return p1[0] * (1 - alpha) + p2[0] * alpha, p1[1] * (1 - alpha) + p2[1] * alpha
+
+# Loading model and video information 加载模型和视频信息
+model = YOLO(MODEL_PATH)
+cap = cv2.VideoCapture(VIDEO_PATH)
+fps = cap.get(cv2.CAP_PROP_FPS)
+W, H = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+frame_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+cap.release()
+
+# Initialize tracking data 初始化追踪数据
+tracks = [{"id": i, "centroids": [None, None], "active": False, "age": 0} for i in range(MAX_IDS)]
+results_raw = []
+trajectories = {i: [] for i in range(MAX_IDS)}
+frame_idx = 0
+cap = cv2.VideoCapture(VIDEO_PATH)
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    res = model(frame, imgsz=960, conf=CONF_THRESHOLD, iou=0.5)########640，736，960，1056
+    boxes = res[0].boxes.xyxy.cpu().numpy()
+    confs = res[0].boxes.conf.cpu().numpy()
+
+    if len(boxes) > MAX_IDS:
+        idxs = np.argsort(-confs)[:MAX_IDS]
+        boxes, confs = boxes[idxs], confs[idxs]
+
+    centroids_now = [get_centroid(b, W, H) for b in boxes]
+
+    if frame_idx == 0:
+        sorted_idx = np.argsort([-c[0] for c in centroids_now])
+        for i, idx in enumerate(sorted_idx[:MAX_IDS]):
+            tracks[i]["centroids"] = [centroids_now[idx], centroids_now[idx]]
+            tracks[i]["active"] = True
+            tracks[i]["age"] = 0
+            results_raw.append({"frame": frame_idx, "hexbug": i, "x": centroids_now[idx][0], "y": centroids_now[idx][1]})
+            trajectories[i].append((frame_idx, centroids_now[idx][0], centroids_now[idx][1]))
+        for i in range(len(centroids_now), MAX_IDS):
+            results_raw.append({"frame": frame_idx, "hexbug": i, "x": None, "y": None})
+    else:
+        for t in tracks:
+            if t["active"]: t["age"] += 1
+            if t["age"] > MAX_AGE: t["active"] = False
+
+        active = [t for t in tracks if t["active"] and t["centroids"][1]]
+        cost = np.full((len(active), len(centroids_now)), np.inf)
+
+        for i, t in enumerate(active):
+            p_prev, p_last = t["centroids"]
+            p_predict = (2 * p_last[0] - p_prev[0], 2 * p_last[1] - p_prev[1]) if p_prev != p_last else p_last
+            for j, c_now in enumerate(centroids_now):
+                cost[i, j] = euclidean(p_predict, c_now)
+
+        assigned = [None] * len(centroids_now)
+        if active and centroids_now:
+            ri, ci = linear_sum_assignment(cost)
+            for r, c in zip(ri, ci):
+                if cost[r, c] < MAX_DISTANCE:
+                    t = active[r]
+                    assigned[c] = t["id"]
+                    t["centroids"] = [t["centroids"][1], centroids_now[c]]
+                    t["active"] = True
+                    t["age"] = 0
+
+        unmatched = [j for j in range(len(centroids_now)) if assigned[j] is None]
+        inactive_known = [t for t in tracks if not t["active"] and t["centroids"][1]]
+        cost2 = np.full((len(inactive_known), len(unmatched)), np.inf)
+
+        for i, t in enumerate(inactive_known):
+            for j, idx in enumerate(unmatched):
+                cost2[i, j] = euclidean(t["centroids"][1], centroids_now[idx])
+        ri2, ci2 = linear_sum_assignment(cost2)
+        for r, c in zip(ri2, ci2):
+            if cost2[r, c] < REASSIGN_DISTANCE:
+                t = inactive_known[r]
+                assigned_idx = unmatched[c]
+                assigned[assigned_idx] = t["id"]
+                t["centroids"] = [t["centroids"][1], centroids_now[assigned_idx]]
+                t["active"] = True
+                t["age"] = 0
+
+        unmatched = [j for j in range(len(centroids_now)) if assigned[j] is None]
+        inactive_unknown = [t for t in tracks if not t["active"] and not t["centroids"][1]]
+        for j, t in zip(unmatched, inactive_unknown):
+            assigned[j] = t["id"]
+            t["centroids"] = [centroids_now[j], centroids_now[j]]
+            t["active"] = True
+            t["age"] = 0
+
+        map_id = {id_: j for j, id_ in enumerate(assigned) if id_ is not None}
+        for t in tracks:
+            if t["id"] in map_id:
+                j = map_id[t["id"]]
+                x, y = centroids_now[j]
+                results_raw.append({"frame": frame_idx, "hexbug": t["id"], "x": x, "y": y})
+                trajectories[t["id"]].append((frame_idx, x, y))
+            else:
+                results_raw.append({"frame": frame_idx, "hexbug": t["id"], "x": None, "y": None})
+
+    frame_idx += 1
+
+cap.release()
+cv2.destroyAllWindows()
+
+# Interpolation filling 插值填补
+output = []
+for h_id in range(MAX_IDS):
+    track = sorted([r for r in results_raw if r["hexbug"] == h_id], key=lambda r: r["frame"])
+    pos_map = {r["frame"]: (r["x"], r["y"]) for r in track if r["x"] is not None}
+    for t in range(frame_idx):
+        if t in pos_map:
+            x, y = pos_map[t]
+        else:
+            prev = next((pos_map[pt] for pt in range(t - 1, -1, -1) if pt in pos_map), None)
+            nxt = next((pos_map[nt] for nt in range(t + 1, frame_idx) if nt in pos_map), None)
+            if prev and nxt:
+                alpha = 0.5
+                x, y = interpolate(prev, nxt, alpha)
+            elif prev:
+                x, y = prev
+            elif nxt:
+                x, y = nxt
+            else:
+                x, y = None, None
+        output.append({"": len(output), "t": t, "hexbug": h_id, "x": x, "y": y})
+
+pd.DataFrame(output).to_csv(OUTPUT_CSV, index=False)
+print(f"✅ 优化追踪结果已保存至：{OUTPUT_CSV}")
