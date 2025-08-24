@@ -1,0 +1,81 @@
+from ultralytics import YOLO
+import cv2
+import csv
+from tqdm import tqdm
+import numpy as np
+
+def track_and_export(video_path, 
+                     model_path='runsdetecthexbug_yolov8n5weightsbest.pt',
+                     output_csv='hexbug_path_yolo.csv',
+                     output_video='hexbug_detected_yolo.avi',
+                     conf_threshold=0.2)
+    
+    # 加载模型
+    model = YOLO(model_path)
+
+    # 打开视频
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # 初始化视频写入器
+    fourcc = cv2.VideoWriter_fourcc('XVID')
+    out_vid = cv2.VideoWriter(output_video, fourcc, fps, (w, h))
+
+    # 初始化 CSV 写入器
+    index = 0
+    with open(output_csv, 'w', newline='') as file
+        writer = csv.writer(file)
+        writer.writerow(['','t', 'hexbug', 'x', 'y'])
+
+        # 使用 YOLOv8 跟踪器
+        results = model.track(source=video_path, stream=True, conf=conf_threshold, tracker='bytetrack.yaml')
+
+        t = 0
+        for result in tqdm(results, total=frame_count, desc=Tracking video)
+            frame = result.orig_img.copy()
+            boxes = result.boxes
+
+            if boxes is not None and len(boxes)  0
+                xyxy = boxes.xyxy.cpu().numpy()
+                confs = boxes.conf.cpu().numpy()
+
+                hexbug_id = 0
+                
+                for i in range(len(xyxy))
+                    if confs[i]  conf_threshold
+                        continue
+
+                    x1, y1, x2, y2 = xyxy[i]
+                    cx = (x1 + x2)  2
+                    cy = (y1 + y2)  2
+                    
+                    #index = 0  
+                    writer.writerow([index,t, hexbug_id, cx, cy])
+                    #index += 1
+
+                    # 可视化
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                    cv2.putText(frame, f'ID {hexbug_id}', (int(x1), int(y1) - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                    hexbug_id += 1
+            else
+                # 没有检测到任何目标，写入一行 -1 占位
+                writer.writerow([t, -1, -1, -1])
+                
+            index += 1
+            out_vid.write(frame)
+            t += 1
+
+    cap.release()
+    out_vid.release()
+    print(f✅ 检测完成，视频保存为：{output_video})
+    print(f✅ CSV 结果保存为：{output_csv})
+
+    return output_video
+
+# ▶️ 运行函数
+video_result = track_and_export('training018.mp4')
